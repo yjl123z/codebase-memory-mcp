@@ -1591,8 +1591,11 @@ static bool emit_overpass_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
     char route_name[CBM_SZ_256];
     snprintf(route_name, sizeof(route_name), "%s/%s", service, method);
 
+    char route_props[CBM_SZ_512];
+    snprintf(route_props, sizeof(route_props),
+             "{\"source\":\"overpass\",\"service\":\"%s\",\"method\":\"%s\"}", service, method);
     int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", route_name, route_qn, "", 0, 0,
-                                            "{\"source\":\"overpass\"}");
+                                            route_props);
 
     char esc_c[CBM_SZ_256];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);

@@ -702,11 +702,59 @@ TEST(grpc_no_phantom_route_from_plain_var_issue294) {
     PASS();
 }
 
+TEST(overpass_rawcall_route_has_service_and_method_properties) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_overpass_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    const char *go_mod = TH_PATH(tmpdir, "go.mod");
+    const char *main_go = TH_PATH(tmpdir, "main.go");
+    ASSERT_EQ(th_write_file(go_mod, "module example.com/overpassdemo\n\ngo 1.21\n"), 0);
+    ASSERT_EQ(th_write_file(main_go,
+                            "package main\n\n"
+                            "import (\n"
+                            "\t\"context\"\n"
+                            "\tdata_life_mall_pack "
+                            "\"code.byted.org/overpass/data_life_mall_pack/rpc/"
+                            "data_life_mall_pack\"\n"
+                            ")\n\n"
+                            "func PackPoiData(ctx context.Context, req interface{}) {\n"
+                            "\tdata_life_mall_pack.RawCall.PackMallPoiData(ctx, req)\n"
+                            "}\n"),
+              0);
+
+    cbm_file_info_t files[2] = {0};
+    files[0].path = (char *)go_mod;
+    files[0].rel_path = (char *)"go.mod";
+    files[0].language = CBM_LANG_GOMOD;
+    files[1].path = (char *)main_go;
+    files[1].rel_path = (char *)"main.go";
+    files[1].language = CBM_LANG_GO;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_overpass", tmpdir, files, 2, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *route =
+        cbm_gbuf_find_by_qn(gbuf, "__grpc__data_life_mall_pack/PackMallPoiData");
+    ASSERT_NOT_NULL(route);
+    ASSERT_NOT_NULL(route->properties_json);
+    ASSERT_NOT_NULL(strstr(route->properties_json, "\"source\":\"overpass\""));
+    ASSERT_NOT_NULL(strstr(route->properties_json, "\"service\":\"data_life_mall_pack\""));
+    ASSERT_NOT_NULL(strstr(route->properties_json, "\"method\":\"PackMallPoiData\""));
+
+    cbm_gbuf_free(gbuf);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
     RUN_TEST(grpc_service_name_preserves_service_suffix_issue294);
     RUN_TEST(grpc_no_phantom_route_from_plain_var_issue294);
+    RUN_TEST(overpass_rawcall_route_has_service_and_method_properties);
     /* Graph buffer merge/shared-ID tests */
     RUN_TEST(gbuf_shared_ids_unique);
     RUN_TEST(gbuf_merge_nodes);
