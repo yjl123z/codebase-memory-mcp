@@ -529,6 +529,21 @@ static void count_lsp_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
     }
 }
 
+static const cbm_gbuf_node_t *find_node_by_name_file(cbm_gbuf_t *gbuf, const char *name,
+                                                     const char *file_path) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, name, &nodes, &count) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        if (nodes[i] && nodes[i]->file_path && strcmp(nodes[i]->file_path, file_path) == 0) {
+            return nodes[i];
+        }
+    }
+    return NULL;
+}
+
 TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_pylsp_XXXXXX");
@@ -584,6 +599,109 @@ TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
 
     unlink(fpath0);
     rmdir(tmpdir);
+    PASS();
+}
+
+TEST(parallel_go_chained_constructor_handle_uses_lsp_target) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_go_chain_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    const char *gomod = TH_PATH(tmpdir, "go.mod");
+    const char *route_go = TH_PATH(tmpdir, "app/route.go");
+    const char *rec_go = TH_PATH(tmpdir, "rec/recommend.go");
+    const char *other_go = TH_PATH(tmpdir, "other/other.go");
+    ASSERT_EQ(th_write_file(gomod, "module example.com/chain\n\ngo 1.21\n"), 0);
+    ASSERT_EQ(th_write_file(rec_go,
+                            "package rec\n\n"
+                            "import \"context\"\n\n"
+                            "type Request struct{}\n"
+                            "type RecommendMallProductsHandler struct{}\n\n"
+                            "func NewRecommendMallProductsHandler(req *Request) "
+                            "*RecommendMallProductsHandler {\n"
+                            "\treturn &RecommendMallProductsHandler{}\n"
+                            "}\n\n"
+                            "func (h *RecommendMallProductsHandler) Handle(ctx context.Context) "
+                            "error {\n"
+                            "\treturn nil\n"
+                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file(other_go,
+                            "package other\n\n"
+                            "import \"context\"\n\n"
+                            "type OtherHandler struct{}\n\n"
+                            "func (h *OtherHandler) Handle(ctx context.Context) error {\n"
+                            "\treturn nil\n"
+                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file(route_go,
+                            "package app\n\n"
+                            "import (\n"
+                            "\t\"context\"\n"
+                            "\t\"example.com/chain/rec\"\n"
+                            "\t_ \"example.com/chain/other\"\n"
+                            ")\n\n"
+                            "func route(ctx context.Context, req *rec.Request) error {\n"
+                            "\treturn rec.NewRecommendMallProductsHandler(req).Handle(ctx)\n"
+                            "}\n"),
+              0);
+    ASSERT_EQ(th_append_file(route_go,
+                             "\nfunc unresolved(ctx context.Context) {\n"
+                             "\tmissing.External(ctx)\n"
+                             "}\n"),
+              0);
+
+    cbm_file_info_t files[4] = {0};
+    files[0].path = (char *)gomod;
+    files[0].rel_path = (char *)"go.mod";
+    files[0].language = CBM_LANG_GOMOD;
+    files[1].path = (char *)rec_go;
+    files[1].rel_path = (char *)"rec/recommend.go";
+    files[1].language = CBM_LANG_GO;
+    files[2].path = (char *)other_go;
+    files[2].rel_path = (char *)"other/other.go";
+    files[2].language = CBM_LANG_GO;
+    files[3].path = (char *)route_go;
+    files[3].rel_path = (char *)"app/route.go";
+    files[3].language = CBM_LANG_GO;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_par_go_chain", tmpdir, files, 4, 2);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_node_t *route = find_node_by_name_file(gbuf, "route", "app/route.go");
+    const cbm_gbuf_node_t *correct = find_node_by_name_file(gbuf, "Handle", "rec/recommend.go");
+    const cbm_gbuf_node_t *wrong = find_node_by_name_file(gbuf, "Handle", "other/other.go");
+    ASSERT_NOT_NULL(route);
+    ASSERT_NOT_NULL(correct);
+    ASSERT_NOT_NULL(wrong);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gbuf, route->id, "CALLS", &edges, &edge_count),
+              0);
+    bool found_correct = false;
+    bool found_wrong = false;
+    for (int i = 0; i < edge_count; i++) {
+        if (!edges[i]) {
+            continue;
+        }
+        if (edges[i]->target_id == correct->id) {
+            found_correct = true;
+            ASSERT_NOT_NULL(edges[i]->properties_json);
+            ASSERT_NOT_NULL(strstr(edges[i]->properties_json, "\"strategy\":\"go_chained_return_type\""));
+            ASSERT_NULL(strstr(edges[i]->properties_json, "\"strategy\":\"suffix_match\""));
+        }
+        if (edges[i]->target_id == wrong->id) {
+            found_wrong = true;
+        }
+    }
+    ASSERT_TRUE(found_correct);
+    ASSERT_FALSE(found_wrong);
+
+    cbm_gbuf_free(gbuf);
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -766,6 +884,7 @@ SUITE(parallel) {
     /* Parallel pipeline parity tests */
     RUN_TEST(parallel_node_count);
     RUN_TEST(parallel_python_lsp_override_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_go_chained_constructor_handle_uses_lsp_target);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);

@@ -367,6 +367,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
 
     /* LSP-resolved calls take precedence over registry-textual matching. */
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call);
+    if (!lsp && lang == CBM_LANG_GO) {
+        lsp = cbm_pipeline_find_lsp_resolution_go_chained(lsp_calls, call);
+    }
     if (lsp) {
         const cbm_gbuf_node_t *target_node =
             cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn);

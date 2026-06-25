@@ -77,6 +77,46 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
     return best;
 }
 
+/* Go chained selectors can preserve the receiver expression in the textual
+ * callee, e.g. NewHandler().Handle becomes pkg.NewHandler.Handle. Go LSP emits
+ * the resolved method as ...Handler.Handle, whose short name is just Handle.
+ * This helper keeps the fallback language-scoped and caller-scoped instead of
+ * widening generic name matching. */
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_go_chained(
+    const CBMResolvedCallArray *arr, const CBMCall *call) {
+    if (!arr || arr->count == 0 || !call || !call->enclosing_func_qn || !call->callee_name) {
+        return NULL;
+    }
+    const char *callee_last = strrchr(call->callee_name, '.');
+    if (!callee_last || !callee_last[SKIP_ONE]) {
+        return NULL;
+    }
+    callee_last += SKIP_ONE;
+
+    const CBMResolvedCall *best = NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (!rc->caller_qn || !rc->callee_qn) {
+            continue;
+        }
+        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+            continue;
+        }
+        if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
+            continue;
+        }
+        const char *short_name = strrchr(rc->callee_qn, '.');
+        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
+        if (strcmp(short_name, callee_last) != 0) {
+            continue;
+        }
+        if (!best || rc->confidence > best->confidence) {
+            best = rc;
+        }
+    }
+    return best;
+}
+
 /* Resolve an LSP-emitted callee_qn to a graph-buffer node.
  *
  * Per-file LSPs (notably py_lsp) sometimes emit `callee_qn` as the raw

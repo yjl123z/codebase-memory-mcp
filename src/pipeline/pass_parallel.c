@@ -1843,6 +1843,136 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     }
 }
 
+static const char *pp_json_string_prop(const char *json, const char *key, char *buf, size_t bufsz) {
+    if (!json || !key || !buf || bufsz == 0) {
+        return NULL;
+    }
+    char pattern[CBM_SZ_128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char *start = strstr(json, pattern);
+    if (!start) {
+        return NULL;
+    }
+    start += strlen(pattern);
+    const char *end = strchr(start, '"');
+    if (!end) {
+        return NULL;
+    }
+    size_t len = (size_t)(end - start);
+    if (len >= bufsz) {
+        len = bufsz - SKIP_ONE;
+    }
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static const char *go_type_short_name(const char *type_text) {
+    if (!type_text) {
+        return NULL;
+    }
+    while (*type_text == ' ' || *type_text == '\t' || *type_text == '*' || *type_text == '(') {
+        type_text++;
+    }
+    const char *end = type_text + strlen(type_text);
+    while (end > type_text &&
+           (end[-1] == ' ' || end[-1] == '\t' || end[-1] == ')' || end[-1] == '\n')) {
+        end--;
+    }
+    const char *last_dot = NULL;
+    const char *last_slash = NULL;
+    for (const char *p = type_text; p < end; p++) {
+        if (*p == '.') {
+            last_dot = p;
+        } else if (*p == '/') {
+            last_slash = p;
+        }
+    }
+    const char *base = last_dot ? last_dot + SKIP_ONE : (last_slash ? last_slash + SKIP_ONE : type_text);
+    return (base < end) ? base : NULL;
+}
+
+static bool qn_parent_short_matches(const char *parent_qn, const char *short_type) {
+    if (!parent_qn || !short_type || !short_type[0]) {
+        return false;
+    }
+    const char *last = strrchr(parent_qn, '.');
+    last = last ? last + SKIP_ONE : parent_qn;
+    return strcmp(last, short_type) == 0;
+}
+
+static bool try_go_chained_constructor_method(resolve_ctx_t *rc, cbm_resolution_t *res,
+                                              const char *callee_name, const char *module_qn,
+                                              const char **imp_keys, const char **imp_vals,
+                                              int imp_count) {
+    if (!rc || !res || !callee_name) {
+        return false;
+    }
+    const char *last_dot = strrchr(callee_name, '.');
+    if (!last_dot || !last_dot[SKIP_ONE]) {
+        return false;
+    }
+    const char *method = last_dot + SKIP_ONE;
+    size_t ctor_len = (size_t)(last_dot - callee_name);
+    if (ctor_len == 0 || ctor_len >= CBM_SZ_512) {
+        return false;
+    }
+    char ctor_callee[CBM_SZ_512];
+    memcpy(ctor_callee, callee_name, ctor_len);
+    ctor_callee[ctor_len] = '\0';
+
+    cbm_resolution_t ctor_res =
+        cbm_registry_resolve(rc->registry, ctor_callee, module_qn, imp_keys, imp_vals, imp_count);
+    if (!ctor_res.qualified_name || !ctor_res.qualified_name[0]) {
+        return false;
+    }
+    const cbm_gbuf_node_t *ctor_node = cbm_gbuf_find_by_qn(rc->main_gbuf, ctor_res.qualified_name);
+    if (!ctor_node || !ctor_node->properties_json) {
+        return false;
+    }
+    char return_type[CBM_SZ_256];
+    if (!pp_json_string_prop(ctor_node->properties_json, "return_type", return_type,
+                             sizeof(return_type))) {
+        return false;
+    }
+    const char *short_type = go_type_short_name(return_type);
+    if (!short_type || !short_type[0]) {
+        return false;
+    }
+
+    const cbm_gbuf_node_t **methods = NULL;
+    int method_count = 0;
+    if (cbm_gbuf_find_by_name(rc->main_gbuf, method, &methods, &method_count) != 0) {
+        return false;
+    }
+    const cbm_gbuf_node_t *match = NULL;
+    for (int i = 0; i < method_count; i++) {
+        const cbm_gbuf_node_t *cand = methods[i];
+        if (!cand || !cand->label || strcmp(cand->label, "Method") != 0 || !cand->properties_json) {
+            continue;
+        }
+        char parent[CBM_SZ_512];
+        if (!pp_json_string_prop(cand->properties_json, "parent_class", parent, sizeof(parent))) {
+            continue;
+        }
+        if (!qn_parent_short_matches(parent, short_type)) {
+            continue;
+        }
+        if (match) {
+            return false; /* Ambiguous receiver short name; keep existing resolution. */
+        }
+        match = cand;
+    }
+    if (!match) {
+        return false;
+    }
+    res->qualified_name = match->qualified_name;
+    res->strategy = "go_chained_return_type";
+    res->confidence = 0.92;
+    res->candidate_count = 1;
+    return true;
+}
+
 /* Free a strdup'd key stored in the per-file lsp_idx hash table. */
 static void lsp_idx_free_key(const char *key, void *value, void *ud) {
     (void)value;
@@ -1924,12 +2054,25 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             if (kn > 0 && kn < (int)sizeof(key)) {
                 lsp = (const CBMResolvedCall *)cbm_ht_get(lsp_idx, key);
             }
+            if (!lsp && lang == CBM_LANG_GO) {
+                const char *last = strrchr(call->callee_name, '.');
+                if (last && last[SKIP_ONE]) {
+                    kn = snprintf(key, sizeof(key), "%s|%s", call->enclosing_func_qn,
+                                  last + SKIP_ONE);
+                    if (kn > 0 && kn < (int)sizeof(key)) {
+                        lsp = (const CBMResolvedCall *)cbm_ht_get(lsp_idx, key);
+                    }
+                }
+            }
         }
         if (!lsp) {
             /* Fallback to the linear scan for edge cases the index may
              * miss (e.g. callee_name that wasn't the registered short
              * name). Keeps semantics identical. */
             lsp = cbm_pipeline_find_lsp_resolution(&result->resolved_calls, call);
+            if (!lsp && lang == CBM_LANG_GO) {
+                lsp = cbm_pipeline_find_lsp_resolution_go_chained(&result->resolved_calls, call);
+            }
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_lsp_lookup, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -1960,6 +2103,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
 
         _rc_t0 = extract_now_ns();
         try_field_type_hint(rc, &res, call->callee_name, source_node->id);
+        if (lang == CBM_LANG_GO &&
+            (!(res.qualified_name && res.qualified_name[0]) ||
+             (res.strategy && strcmp(res.strategy, "suffix_match") == 0 && res.confidence < 0.6))) {
+            try_go_chained_constructor_method(rc, &res, call->callee_name, module_qn, imp_keys,
+                                              imp_vals, imp_count);
+        }
         atomic_fetch_add_explicit(&rc->time_ns_rc_hint, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
 

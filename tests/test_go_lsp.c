@@ -854,6 +854,70 @@ TEST(golsp_crossfile_return_type_chain) {
     PASS();
 }
 
+TEST(golsp_crossfile_chained_constructor_handle_dispatch) {
+    const char *source = "package main\n\n"
+                         "import (\n"
+                         "\t\"context\"\n"
+                         "\t\"myapp/rec\"\n"
+                         "\t_ \"myapp/other\"\n"
+                         ")\n\n"
+                         "func route(ctx context.Context, req *rec.Request) error {\n"
+                         "\treturn rec.NewRecommendMallProductsHandler(req).Handle(ctx)\n}\n";
+
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.route",
+         .short_name = "route",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "myapp/rec.Request",
+         .short_name = "Request",
+         .label = "Type",
+         .def_module_qn = "myapp/rec"},
+        {.qualified_name = "myapp/rec.RecommendMallProductsHandler",
+         .short_name = "RecommendMallProductsHandler",
+         .label = "Type",
+         .def_module_qn = "myapp/rec"},
+        {.qualified_name = "myapp/rec.NewRecommendMallProductsHandler",
+         .short_name = "NewRecommendMallProductsHandler",
+         .label = "Function",
+         .def_module_qn = "myapp/rec",
+         .return_types = "*RecommendMallProductsHandler"},
+        {.qualified_name = "myapp/rec.RecommendMallProductsHandler.Handle",
+         .short_name = "Handle",
+         .label = "Method",
+         .def_module_qn = "myapp/rec",
+         .receiver_type = "myapp/rec.RecommendMallProductsHandler"},
+        {.qualified_name = "myapp/other.OtherHandler",
+         .short_name = "OtherHandler",
+         .label = "Type",
+         .def_module_qn = "myapp/other"},
+        {.qualified_name = "myapp/other.OtherHandler.Handle",
+         .short_name = "Handle",
+         .label = "Method",
+         .def_module_qn = "myapp/other",
+         .receiver_type = "myapp/other.OtherHandler"},
+    };
+    const char *imp_names[] = {"rec", "other"};
+    const char *imp_qns[] = {"myapp/rec", "myapp/other"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 7, imp_names,
+                         imp_qns, 2, NULL, &out);
+
+    int idx = find_resolved_arr_confident(&out, "route", "Handle");
+    ASSERT_GTE(idx, 0);
+    ASSERT_STR_EQ(out.items[idx].callee_qn, "myapp/rec.RecommendMallProductsHandler.Handle");
+    ASSERT_STR_EQ(out.items[idx].strategy, "lsp_type_dispatch");
+    ASSERT_TRUE(out.items[idx].confidence >= 0.90f);
+    ASSERT_TRUE(find_resolved_arr(&out, "route", "OtherHandler.Handle") < 0);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(golsp_crossfile_interface_dispatch) {
     const char *source = "package main\n\n"
                          "import \"myapp/svc\"\n\n"
@@ -1181,6 +1245,7 @@ SUITE(go_lsp) {
     /* Cross-file */
     RUN_TEST(golsp_crossfile_method_dispatch);
     RUN_TEST(golsp_crossfile_return_type_chain);
+    RUN_TEST(golsp_crossfile_chained_constructor_handle_dispatch);
     RUN_TEST(golsp_crossfile_interface_dispatch);
     RUN_TEST(golsp_crossfile_interface_field_chain);
     RUN_TEST(golsp_crossfile_map_index);
